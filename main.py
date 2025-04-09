@@ -1,90 +1,82 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 import pdfplumber
+import pytesseract
+from pdf2image import convert_from_path
 import re
-from typing import List, Dict, Optional
 import os
+from typing import Dict
+from PIL import Image
 
 app = FastAPI()
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def is_scanned_pdf(pdf_path: str) -> bool:
+    """Verifica se o PDF é escaneado (imagem)"""
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            text = "\n".join(page.extract_text() for page in pdf.pages)
-        return text
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao extrair texto do PDF: {str(e)}")
+            # Se extrair pouco texto, provavelmente é imagem
+            text = pdf.pages[0].extract_text()
+            return len(text or "") < 50  # Limite arbitrário
+    except:
+        return True
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """Extrai texto de PDFs textuais ou escaneados"""
+    if is_scanned_pdf(pdf_path):
+        try:
+            images = convert_from_path(pdf_path, dpi=300)
+            return "\n".join(pytesseract.image_to_string(img, lang='por') for img in images)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro no OCR: {str(e)}")
+    else:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                return "\n".join(page.extract_text(x_tolerance=2) or "" for page in pdf.pages)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro ao extrair texto: {str(e)}")
 
 def parse_paycheck(text: str) -> Dict:
     try:
-        # Padrões atualizados para extração
-        nome_match = re.search(r"(\d{9})\s([A-ZÀ-Ú\s]+)\s+GP:", text)
-        mes_ano_match = re.search(r"(JANEIRO|FEVEREIRO|MAR[ÇC]O|ABRIL|MAIO|JUNHO|JULHO|AGOSTO|SETEMBRO|OUTUBRO|NOVEMBRO|DEZEMBRO)\/\d{4}", text, re.IGNORECASE)
-        
-        nome = nome_match.group(2).strip() if nome_match else "NÃO ENCONTRADO"
-        matricula = nome_match.group(1).strip() if nome_match else "NÃO ENCONTRADA" 
-        mes_ano = mes_ano_match.group(0).strip() if mes_ano_match else "NÃO ENCONTRADO"
+        # Extração de campos básicos (regex robusta)
+        nome = re.search(r"(?i)NOME[\s:]*\n(.+)", text)
+        matricula = re.search(r"(?i)MATR[ÍI]CULA[\s:]*\n(\d+)", text)
+        mes_ano = re.search(r"\d{2}/\d{4}", text)
 
-        # Extrair vantagens - padrão atualizado
+        # Extração de vantagens (compatível com ambos formatos)
         vantagens = []
-        lines = text.split('\n')
-        start_processing = False
-        
-        for line in lines:
-            if "CNS/VDS" in line and "CONSIG/VANT/DESC" in line:
-                start_processing = True
-                continue
-            if "******** TOTAL VENTAGENS" in line:
-                start_processing = False
-            
-            if start_processing and line.strip() and '/' in line[:10]:
-                parts = re.split(r'\s{2,}', line.strip())
-                if len(parts) >= 4:
-                    codigo = parts[0].replace('/', '').strip()
-                    descricao = parts[1].strip()
-                    percentual = float(parts[2].replace(',', '.')) if parts[2].strip() and parts[2].strip() != '-' else None
-                    valor = float(parts[3].replace('.', '').replace(',', '.'))
-                    
-                    vantagens.append({
-                        "codigo": codigo,
-                        "descricao": descricao,
-                        "percentual_duracao": percentual,
-                        "valor": valor
-                    })
+        for line in text.split('\n'):
+            if match := re.search(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)\s*$", line.strip()):
+                codigo, descricao, valor = match.groups()
+                vantagens.append({
+                    "codigo": codigo,
+                    "descricao": descricao.strip(),
+                    "valor": float(valor.replace(".", "").replace(",", "."))
+                })
 
         return {
-            "nome_completo": nome,
-            "matricula": matricula,
-            "mes_ano_referencia": mes_ano,
+            "nome_completo": nome.group(1).strip() if nome else "NÃO ENCONTRADO",
+            "matricula": matricula.group(1).strip() if matricula else "NÃO ENCONTRADA",
+            "mes_ano_referencia": mes_ano.group(0) if mes_ano else "NÃO ENCONTRADO",
             "vantagens": vantagens
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao processar contracheque: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Erro no parsing: {str(e)}")
 
 @app.post("/parse-pdf")
 async def parse_pdf(file: UploadFile = File(...)):
+    temp_path = "temp_pdf.pdf"
     try:
-        temp_pdf_path = "temp_contracheque.pdf"
-        with open(temp_pdf_path, "wb") as buffer:
+        # Salva o arquivo temporariamente
+        with open(temp_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        text = extract_text_from_pdf(temp_pdf_path)
+        # Processamento híbrido
+        text = extract_text_from_pdf(temp_path)
+        result = parse_paycheck(text)
         
-        # Processar múltiplos contracheques
-        sections = re.split(r'(?=GOVERNO DO ESTADO DA BAHIA)', text)
-        contracheques = []
-        
-        for section in sections:
-            if section.strip():
-                result = parse_paycheck(section)
-                if result['vantagens']:  # Só adiciona se encontrar vantagens
-                    contracheques.append(result)
-
-        os.remove(temp_pdf_path)
-        return {"contracheques": contracheques}
-    except Exception as e:
-        if os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        return result
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 if __name__ == "__main__":
     import uvicorn
