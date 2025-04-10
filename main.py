@@ -28,7 +28,7 @@ class VantagensExtractor:
                         return self._parse_from_text(text)
             
             # Fallback para OCR se necessário
-            images = convert_from_path(pdf_path, dpi=400)
+            images = convert_from_path(pdf_path, dpi=500)
             for img in images:
                 processed_img = self._preprocess_image(img)
                 text = pytesseract.image_to_string(processed_img, config=self.tessconfig)
