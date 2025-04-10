@@ -31,11 +31,7 @@ class PDFProcessor:
     def _clean_text(self, text: str) -> str:
         """Corrige erros comuns do OCR"""
         corrections = {
-            r'\b16i/í120t9\b': '16/11/2019',
-            r'\bConfa\.lÉgue\b': 'Contracheque',
-            r'\bGOVERNO\s+D[EO]\s+ESTAD[OA]\b': 'GOVERNO DO ESTADO',
-            r'\bRAM tu,\b': '',
-            r'\bPASSA\b': ''
+  
         }
         for pattern, repl in corrections.items():
             text = re.sub(pattern, repl, text)
