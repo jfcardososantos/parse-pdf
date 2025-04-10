@@ -4,80 +4,91 @@ import pytesseract
 from pdf2image import convert_from_path
 import re
 import os
-from typing import Dict
-from PIL import Image
+from typing import Dict, List
 
 app = FastAPI()
 
-def is_scanned_pdf(pdf_path: str) -> bool:
-    """Verifica se o PDF é escaneado (imagem)"""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Se extrair pouco texto, provavelmente é imagem
-            text = pdf.pages[0].extract_text()
-            return len(text or "") < 50  # Limite arbitrário
-    except:
-        return True
-
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extrai texto de PDFs textuais ou escaneados"""
-    if is_scanned_pdf(pdf_path):
+class PDFParser:
+    @staticmethod
+    def extract_text(pdf_path: str) -> str:
         try:
-            images = convert_from_path(pdf_path, dpi=300)
-            return "\n".join(pytesseract.image_to_string(img, lang='por') for img in images)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro no OCR: {str(e)}")
-    else:
-        try:
+            # Tentativa com pdfplumber primeiro
             with pdfplumber.open(pdf_path) as pdf:
-                return "\n".join(page.extract_text(x_tolerance=2) or "" for page in pdf.pages)
+                text = "\n".join(page.extract_text(x_tolerance=1, y_tolerance=1) or "" for page in pdf.pages)
+                if len(text) > 100:  # Threshold mínimo de texto
+                    return text
+            
+            # Fallback para OCR se necessário
+            images = convert_from_path(pdf_path, dpi=400)
+            return "\n".join(pytesseract.image_to_string(img, lang='por') for img in images)
+        
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao extrair texto: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Extraction failed: {str(e)}")
 
-def parse_paycheck(text: str) -> Dict:
-    try:
-        # Extração de campos básicos (regex robusta)
-        nome = re.search(r"(?i)NOME[\s:]*\n(.+)", text)
-        matricula = re.search(r"(?i)MATR[ÍI]CULA[\s:]*\n(\d+)", text)
-        mes_ano = re.search(r"\d{2}/\d{4}", text)
+    @staticmethod
+    def parse_data(text: str) -> Dict:
+        # Padrões otimizados para documentos da Bahia
+        header_patterns = {
+            'nome': r"(?i)NOME[\s\n]*([A-ZÀ-Ú\s]+)(?=\nMATR|$)",
+            'matricula': r"(?i)MATR[ÍI]CULA[\s\n]*(\d+)",
+            'mes_ano': r"(REFERÊNCIA|COMPETÊNCIA)[\s\n]*(\d{2}/\d{4})"
+        }
 
-        # Extração de vantagens (compatível com ambos formatos)
+        # Extração robusta de campos
+        fields = {}
+        for field, pattern in header_patterns.items():
+            match = re.search(pattern, text)
+            fields[field] = match.group(1).strip() if match else "NÃO ENCONTRADO"
+
+        # Extração de vantagens com tratamento de múltiplos formatos
         vantagens = []
-        for line in text.split('\n'):
-            if match := re.search(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)\s*$", line.strip()):
-                codigo, descricao, valor = match.groups()
+        vantagens_section = re.split(r"(?i)VANTAGENS|PROVENTOS", text)[-1]
+        
+        # Padrão para linhas de vantagens (3 formatos diferentes)
+        for line in vantagens_section.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Formato 1: Código | Descrição | Valor
+            if match := re.search(r"^(\d{4,5})\s+([A-Z\s\/]+)\s+([\d.,]+)$", line):
+                cod, desc, val = match.groups()
                 vantagens.append({
-                    "codigo": codigo,
-                    "descricao": descricao.strip(),
-                    "valor": float(valor.replace(".", "").replace(",", "."))
+                    "codigo": cod,
+                    "descricao": desc.strip(),
+                    "valor": float(val.replace(".", "").replace(",", "."))
+                })
+                
+            # Formato 2: Descrição | Valor (sem código)
+            elif match := re.search(r"^([A-Z][A-Z\sÀ-Ú]+)\s+([\d.,]+)$", line):
+                desc, val = match.groups()
+                vantagens.append({
+                    "codigo": None,
+                    "descricao": desc.strip(),
+                    "valor": float(val.replace(".", "").replace(",", "."))
                 })
 
         return {
-            "nome_completo": nome.group(1).strip() if nome else "NÃO ENCONTRADO",
-            "matricula": matricula.group(1).strip() if matricula else "NÃO ENCONTRADA",
-            "mes_ano_referencia": mes_ano.group(0) if mes_ano else "NÃO ENCONTRADO",
+            "nome_completo": fields['nome'],
+            "matricula": fields['matricula'],
+            "mes_ano_referencia": fields['mes_ano'],
             "vantagens": vantagens
         }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro no parsing: {str(e)}")
 
 @app.post("/parse-pdf")
 async def parse_pdf(file: UploadFile = File(...)):
-    temp_path = "temp_pdf.pdf"
+    temp_path = "temp_parse.pdf"
     try:
-        # Salva o arquivo temporariamente
-        with open(temp_path, "wb") as buffer:
-            buffer.write(await file.read())
-
-        # Processamento híbrido
-        text = extract_text_from_pdf(temp_path)
-        result = parse_paycheck(text)
+        with open(temp_path, "wb") as f:
+            f.write(await file.read())
         
+        text = PDFParser.extract_text(temp_path)
+        result = PDFParser.parse_data(text)
+        
+        if result["nome_completo"] == "NÃO ENCONTRADO":
+            raise HTTPException(status_code=422, detail="Estrutura do documento não reconhecida")
+            
         return result
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
