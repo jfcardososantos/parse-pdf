@@ -9,7 +9,6 @@ import numpy as np
 from typing import List, Dict, Optional
 from PIL import Image
 import uvicorn
-import json
 
 app = FastAPI()
 
@@ -17,163 +16,155 @@ class ContrachequeProcessor:
     def __init__(self):
         self.tessconfig = r'--oem 3 --psm 6 -l por'
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+        
+        # Mapeamento completo das vantagens alvo
         self.vantagens_alvo = {
-            '00002': 'VENCIMENTO',
-            '00017': 'GRAT.A.FIS',
-            '00018': 'GRAT.A.FIS JUD',
-            '00146': 'AD.T.SERV',
-            '00153': 'CET-H.ESP',
-            '00279': 'PDF',
-            '00170': 'AD.NOT.INCORP',
-            '00212': 'DIF SALARIO/RRA'
+            '00002': {'descricao': 'VENCIMENTO', 'tem_percentual': False},
+            '00017': {'descricao': 'GRAT.A.FIS', 'tem_percentual': True},
+            '00018': {'descricao': 'GRAT.A.FIS JUD', 'tem_percentual': True},
+            '00146': {'descricao': 'AD.T.SERV', 'tem_percentual': True},
+            '00153': {'descricao': 'CET-H.ESP', 'tem_percentual': True},
+            '00279': {'descricao': 'PDF', 'tem_percentual': False},
+            '00170': {'descricao': 'AD.NOT.INCORP', 'tem_percentual': True},
+            '00212': {'descricao': 'DIF SALARIO/RRA', 'tem_percentual': True}
         }
 
-    def extract_data(self, pdf_path: str) -> Dict:
-        """Processa o PDF e extrai os dados estruturados"""
+    def processar_documento(self, pdf_path: str) -> Dict:
+        """Processa o documento e retorna os dados estruturados"""
         try:
-            # Extrai texto do PDF
-            text = self._extract_text(pdf_path)
+            text = self._extrair_texto(pdf_path)
             
-            # Parse dos dados
+            # Extração dos campos com fallback
             dados = {
-                "nome_completo": self._extract_field(r"NOME[\s\n]*([A-ZÀ-Ú\s]+)(?=\n|MATR|$)", text),
-                "matricula": self._extract_field(r"MATR[ÍI]CULA[\s\n]*(\d+)", text),
-                "mes_ano_referencia": self._extract_field(r"(\d{2}/\d{4})\s+SRI-SISTEMA", text),
-                "vantagens": self._extract_vantagens(text)
+                "nome_completo": self._extrair_campo(r"NOME[\s\n]*([A-ZÀ-Ú\s]+)(?=\n|MATR|ADMISSÃO|$)", text),
+                "matricula": self._extrair_campo(r"MATR[ÍI]CULA[\s\n]*(\d+)", text),
+                "mes_ano_referencia": self._extrair_campo(r"(?:REFERÊNCIA|COMPETÊNCIA)[\s\n]*(\d{2}/\d{4})", text) 
+                          or self._extrair_campo(r"\d{2}/\d{4}(?=\s+SRI-SISTEMA)", text),
+                "vantagens": self._extrair_vantagens(text)
             }
             
-            # Validação dos campos obrigatórios
-            if not all([dados["nome_completo"], dados["matricula"], dados["vantagens"]]):
-                raise ValueError("Campos essenciais não encontrados")
-                
-            return dados
+            # Remove campos vazios/nulos
+            return {k: v for k, v in dados.items() if v is not None and v != []}
             
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=f"Erro no processamento: {str(e)}")
 
-    def _extract_text(self, pdf_path: str) -> str:
-        """Extrai texto do PDF com fallback para OCR"""
+    def _extrair_texto(self, pdf_path: str) -> str:
+        """Extrai texto com fallback para OCR"""
         try:
-            # Tenta extração textual
+            # Tenta extração textual primeiro
             with pdfplumber.open(pdf_path) as pdf:
-                text = "\n".join(page.extract_text() for page in pdf.pages)
-                if len(text) > 100:  # Limite mínimo de texto
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                if len(text.strip()) > 100:  # Limite mínimo de texto
                     return text
                     
             # Fallback para OCR
-            images = convert_from_path(pdf_path, dpi=500)
+            images = convert_from_path(pdf_path, dpi=400, grayscale=True)
             text = "\n".join(pytesseract.image_to_string(
-                self._preprocess_image(img), 
+                self._preprocessar_imagem(img), 
                 config=self.tessconfig
             ) for img in images)
             
-            return self._clean_text(text)
+            return self._corrigir_texto(text)
             
         except Exception as e:
             raise RuntimeError(f"Falha na extração de texto: {str(e)}")
 
-    def _preprocess_image(self, image):
-        """Pré-processamento da imagem para OCR"""
+    def _preprocessar_imagem(self, image):
+        """Melhora a qualidade da imagem para OCR"""
         img_array = np.array(image)
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
         denoised = cv2.fastNlMeansDenoising(gray, h=30)
         _, threshold = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return Image.fromarray(threshold)
 
-    def _clean_text(self, text: str) -> str:
+    def _corrigir_texto(self, text: str) -> str:
         """Corrige erros comuns de OCR"""
-        corrections = {
+        correcoes = {
             r'\bGOVERNO\s+D[EO]\s+ESTAD[OA]\b': 'GOVERNO DO ESTADO',
             r'\bMATR[ÍI]CULA\b': 'MATRÍCULA',
-            r'\bContra[çc]heque\b': 'Contracheque'
+            r'\bContra[çc]heque\b': 'Contracheque',
+            r'\b(\d)o\b': r'\1º',
+            r'\bSRH-?\b': 'SRI-'
         }
-        for pattern, repl in corrections.items():
-            text = re.sub(pattern, repl, text)
+        for padrao, substituicao in correcoes.items():
+            text = re.sub(padrao, substituicao, text)
         return text
 
-    def _extract_field(self, pattern: str, text: str) -> Optional[str]:
-        """Extrai um campo usando regex"""
-        match = re.search(pattern, text, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+    def _extrair_campo(self, padrao: str, text: str) -> Optional[str]:
+        """Extrai um campo específico com tratamento de erro"""
+        try:
+            match = re.search(padrao, text, re.IGNORECASE)
+            return match.group(1).strip() if match else None
+        except:
+            return None
 
-    def _extract_vantagens(self, text: str) -> List[Dict]:
+    def _extrair_vantagens(self, text: str) -> List[Dict]:
         """Extrai e filtra as vantagens específicas"""
         vantagens = []
         
-        # Encontra a seção de vantagens
-        section_match = re.search(
-            r"VANTAGENS.*?(cód|COD|DISCRIMINAÇÃO).*?\n(.*?)(?=TOTAL DE VANTAGENS|\n\n)",
+        # Encontra a seção de vantagens (com mais tolerância)
+        secao = re.search(
+            r"(?:VANTAGENS|PROVENTOS).*?(?:cód|COD|DISCRIMINAÇÃO).*?\n(.*?)(?=TOTAL\s+DE\s+VANTAGENS|\n\n|$)",
             text, re.DOTALL | re.IGNORECASE
         )
         
-        if not section_match:
+        if not secao:
             return vantagens
             
-        # Processa cada linha da tabela
-        for line in section_match.group(2).split('\n'):
-            line = line.strip()
-            if not line:
+        # Padrões para linhas da tabela
+        padroes = [
+            r"(\d{5})\s+([A-ZÀ-Ú./\s-]+?)\s+([\d.,]+)%?\s+([\d.,]+)",  # Com percentual
+            r"(\d{5})\s+([A-ZÀ-Ú./\s-]+?)\s+([\d.,]+)\s*$"  # Sem percentual
+        ]
+        
+        for linha in secao.group(1).split('\n'):
+            linha = linha.strip()
+            if not linha:
                 continue
                 
-            # Padrão para linhas com código, descrição e valor
-            if match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s-]+?)\s+([\d.,]+)%?\s+([\d.,]+)", line):
-                cod, desc, perc, val = match.groups()
-            elif match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s-]+?)\s+([\d.,]+)\s*$", line):
-                cod, desc, val = match.groups()
-                perc = None
-            else:
-                continue
-                
-            # Filtra apenas as vantagens desejadas
-            if cod in self.vantagens_alvo:
-                vantagem = {
-                    "codigo": cod,
-                    "descricao": self.vantagens_alvo[cod],
-                    "valor": self._parse_money_value(val)
-                }
-                
-                # Adiciona percentual se existir e não for VENCIMENTO ou PDF
-                if perc and cod not in ['00002', '00279']:
-                    vantagem["percentual_duracao"] = self._parse_money_value(perc)
+            for padrao in padroes:
+                if match := re.match(padrao, linha, re.IGNORECASE):
+                    cod = match.group(1)
+                    if cod in self.vantagens_alvo:
+                        vantagem = {
+                            "codigo": cod,
+                            "descricao": self.vantagens_alvo[cod]['descricao'],
+                            "valor": self._parse_valor(match.group(-1))  # Último grupo é sempre o valor
+                        }
+                        
+                        # Adiciona percentual se aplicável
+                        if self.vantagens_alvo[cod]['tem_percentual'] and len(match.groups()) >= 3:
+                            vantagem["percentual_duracao"] = self._parse_valor(match.group(3))
+                            
+                        vantagens.append(vantagem)
+                    break
                     
-                vantagens.append(vantagem)
-                
         return vantagens
 
-    def _parse_money_value(self, value_str: str) -> float:
+    def _parse_valor(self, valor_str: str) -> float:
         """Converte valores brasileiros para float"""
         try:
-            return float(value_str.replace('.', '').replace(',', '.'))
+            return float(valor_str.replace('.', '').replace(',', '.'))
         except:
-            raise ValueError(f"Valor monetário inválido: {value_str}")
+            return 0.0  # Retorna 0 se não conseguir converter
 
-@app.post("/processar-contracheque")
+@app.post("/processar")
 async def processar_contracheque(file: UploadFile = File(...)):
-    """Endpoint principal que retorna os dados formatados em JSON"""
-    temp_path = "temp_pdf.pdf"
+    """Endpoint otimizado para processamento de contracheques"""
+    temp_path = "temp_contracheque.pdf"
     try:
         # Salva o arquivo temporariamente
         with open(temp_path, "wb") as f:
             f.write(await file.read())
         
-        # Processa o documento
         processor = ContrachequeProcessor()
-        dados = processor.extract_data(temp_path)
-        
-        # Formata a resposta conforme especificado
-        response = {
-            "nome_completo": dados["nome_completo"],
-            "matricula": dados["matricula"],
-            "mes_ano_referencia": dados["mes_ano_referencia"],
-            "vantagens": dados["vantagens"]
-        }
-        
-        return response
+        return processor.processar_documento(temp_path)
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
