@@ -7,6 +7,8 @@ import os
 import cv2
 import numpy as np
 from typing import List, Dict
+from PIL import Image  # Importação adicionada aqui
+import uvicorn
 
 app = FastAPI()
 
@@ -95,5 +97,4 @@ async def extrair_vantagens(file: UploadFile = File(...)):
             os.remove(temp_path)
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
