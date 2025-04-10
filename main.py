@@ -12,7 +12,7 @@ from PIL import Image
 import uvicorn
 
 # Configuração ROCm para AMD GPU
-os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.2"
+os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"
 os.environ["GPU_MAX_HEAP_SIZE"] = "100"
 
 app = FastAPI()
