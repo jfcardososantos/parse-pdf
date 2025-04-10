@@ -17,14 +17,28 @@ os.environ["GPU_MAX_HEAP_SIZE"] = "100"
 
 app = FastAPI()
 
+
+def get_amd_platform():
+    """Seleciona automaticamente a plataforma AMD"""
+    platforms = cl.get_platforms()
+    for i, platform in enumerate(platforms):
+        if 'AMD' in platform.name:
+            return platform
+    return platforms[0]  
+
 class AMDProcessor:
     def __init__(self):
         try:
-            self.ctx = cl.create_some_context()
+            # Seleção automática da plataforma AMD
+            amd_platform = get_amd_platform()
+            self.ctx = cl.Context(
+                dev_type=cl.device_type.GPU,
+                properties=[(cl.context_properties.PLATFORM, amd_platform)]
+            )
             self.queue = cl.CommandQueue(self.ctx)
             self._build_kernels()
             self._init_ocr()
-            logging.info("Processador AMD inicializado com sucesso")
+            logging.info(f"Plataforma selecionada: {amd_platform.name}")
         except Exception as e:
             logging.error(f"Erro na inicialização: {str(e)}")
             raise
