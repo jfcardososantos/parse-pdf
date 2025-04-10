@@ -7,7 +7,7 @@ import os
 import cv2
 import numpy as np
 from typing import List, Dict
-from PIL import Image  # Importação adicionada aqui
+from PIL import Image
 import uvicorn
 
 app = FastAPI()
@@ -16,6 +16,7 @@ class VantagensExtractor:
     def __init__(self):
         self.tessconfig = r'--oem 3 --psm 6 -l por'
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+        self.money_pattern = re.compile(r'(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)')  # Padrão para valores BR
 
     def extract_vantagens_section(self, pdf_path: str) -> Dict:
         """Extrai especificamente a seção de vantagens"""
@@ -28,7 +29,7 @@ class VantagensExtractor:
                         return self._parse_from_text(text)
             
             # Fallback para OCR se necessário
-            images = convert_from_path(pdf_path, dpi=500)
+            images = convert_from_path(pdf_path, dpi=500)  # DPI aumentado
             for img in images:
                 processed_img = self._preprocess_image(img)
                 text = pytesseract.image_to_string(processed_img, config=self.tessconfig)
@@ -48,6 +49,14 @@ class VantagensExtractor:
         _, threshold = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return Image.fromarray(threshold)
 
+    def _parse_money_value(self, value_str: str) -> float:
+        """Converte valores brasileiros (1.234,56) para float"""
+        try:
+            clean_value = value_str.replace('.', '').replace(',', '.')
+            return float(clean_value)
+        except:
+            raise ValueError(f"Valor monetário inválido: {value_str}")
+
     def _parse_from_text(self, text: str) -> Dict:
         """Analisa o texto extraído para obter as vantagens"""
         # Encontra a seção de vantagens
@@ -65,19 +74,29 @@ class VantagensExtractor:
         for line in lines:
             # Padrão para linhas de vantagens (código, descrição, valor)
             if match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)\s*$", line):
-                vantagens.append({
-                    "codigo": match.group(1),
-                    "descricao": match.group(2).strip(),
-                    "valor": float(match.group(3).replace(".", "").replace(",", "."))
-                })
+                try:
+                    vantagens.append({
+                        "codigo": match.group(1),
+                        "descricao": match.group(2).strip(),
+                        "valor": self._parse_money_value(match.group(3))
+                    })
+                except ValueError as e:
+                    continue
+            
             # Padrão alternativo para linhas com percentual
             elif match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)%?\s+([\d.,]+)", line):
-                vantagens.append({
-                    "codigo": match.group(1),
-                    "descricao": match.group(2).strip(),
-                    "percentual": float(match.group(3).replace(",", ".")),
-                    "valor": float(match.group(4).replace(".", "").replace(",", "."))
-                })
+                try:
+                    vantagens.append({
+                        "codigo": match.group(1),
+                        "descricao": match.group(2).strip(),
+                        "percentual": float(match.group(3).replace(",", ".")),
+                        "valor": self._parse_money_value(match.group(4))
+                    })
+                except ValueError as e:
+                    continue
+        
+        if not vantagens:
+            raise HTTPException(status_code=422, detail="Nenhuma vantagem válida encontrada")
         
         return {"vantagens": vantagens}
 
