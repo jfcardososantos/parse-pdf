@@ -1,116 +1,99 @@
-from fastapi import FastAPI, UploadFile, File
-from pdf2image import convert_from_path
+from fastapi import FastAPI, UploadFile, File, HTTPException
+import pdfplumber
 import pytesseract
+from pdf2image import convert_from_path
 import re
 import os
-from typing import Dict, List
-import uvicorn
-from PIL import Image
-import logging
+import cv2
+import numpy as np
+from typing import List, Dict
 
 app = FastAPI()
 
-class PDFProcessor:
+class VantagensExtractor:
     def __init__(self):
         self.tessconfig = r'--oem 3 --psm 6 -l por'
         pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-        
-    def extract_full_text(self, pdf_path: str) -> str:
-        """Extrai todo o texto do PDF sem truncar"""
+
+    def extract_vantagens_section(self, pdf_path: str) -> Dict:
+        """Extrai especificamente a seção de vantagens"""
         try:
-            images = convert_from_path(pdf_path, dpi=400, grayscale=True)
-            full_text = ""
+            # Tenta extração textual primeiro
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if "VANTAGENS" in text:
+                        return self._parse_from_text(text)
+            
+            # Fallback para OCR se necessário
+            images = convert_from_path(pdf_path, dpi=400)
             for img in images:
-                text = pytesseract.image_to_string(img, config=self.tessconfig)
-                full_text += self._clean_text(text) + "\n"
-            return full_text
+                processed_img = self._preprocess_image(img)
+                text = pytesseract.image_to_string(processed_img, config=self.tessconfig)
+                if "VANTAGENS" in text:
+                    return self._parse_from_text(text)
+            
+            raise HTTPException(status_code=400, detail="Seção VANTAGENS não encontrada")
+        
         except Exception as e:
-            logging.error(f"Erro na extração: {str(e)}")
-            raise
+            raise HTTPException(status_code=500, detail=str(e))
 
-    def _clean_text(self, text: str) -> str:
-        """Corrige erros comuns do OCR"""
-        corrections = {
-  
-        }
-        for pattern, repl in corrections.items():
-            text = re.sub(pattern, repl, text)
-        return text
+    def _preprocess_image(self, image):
+        """Melhora a qualidade da imagem para OCR"""
+        img_array = np.array(image)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(gray, h=30)
+        _, threshold = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return Image.fromarray(threshold)
 
-    def parse_paycheck(self, text: str) -> Dict:
-        """Extrai dados estruturados do texto completo"""
-        try:
-            # Extração dos campos principais
-            data = {
-                "data_referencia": self._extract_field(r"(\d{2}/\d{2}/\d{4})", text),
-                "nome_completo": self._extract_field(r"NOME[\s\n]*([A-ZÀ-Ú\s]+)(?=\n|MATR|$)", text),
-                "matricula": self._extract_field(r"MATR[ÍI]CULA[\s\n]*(\d+)", text),
-                "orgao": self._extract_field(r"ÓRGÃO/ENTIDADE[\s\n]*([^\n]+)", text),
-                "vantagens": self._extract_table(text, "VANTAGENS", "DESCONTOS")
-            }
-            return data
-        except Exception as e:
-            logging.error(f"Erro no parsing: {str(e)}")
-            raise
-
-    def _extract_field(self, pattern: str, text: str) -> str:
-        """Extrai um campo específico usando regex"""
-        match = re.search(pattern, text, re.IGNORECASE)
-        return match.group(1).strip() if match else "NÃO ENCONTRADO"
-
-    def _extract_table(self, text: str, start_marker: str, end_marker: str) -> List[Dict]:
-        """Extrai dados tabulares"""
-        table_section = re.search(
-            f"{start_marker}.*?{end_marker}(.*?)(?:\n\s*\n|\Z)",
-            text, re.DOTALL
+    def _parse_from_text(self, text: str) -> Dict:
+        """Analisa o texto extraído para obter as vantagens"""
+        # Encontra a seção de vantagens
+        vantagens_section = re.search(
+            r"VANTAGENS.*?(cód|COD).*?\n(.*?)(?=TOTAL DE VANTAGENS|\n\n)",
+            text, re.DOTALL | re.IGNORECASE
         )
         
-        if not table_section:
-            return []
-            
-        table_text = table_section.group(1)
-        lines = [line.strip() for line in table_text.split('\n') if line.strip()]
+        if not vantagens_section:
+            raise HTTPException(status_code=422, detail="Formato da tabela de vantagens não reconhecido")
         
-        items = []
+        lines = [line.strip() for line in vantagens_section.group(2).split('\n') if line.strip()]
+        
+        vantagens = []
         for line in lines:
-            if re.match(r"\d{5}", line):  # Linhas que começam com código
-                parts = re.split(r'\s{2,}', line)
-                if len(parts) >= 3:
-                    items.append({
-                        "codigo": parts[0],
-                        "descricao": parts[1],
-                        "valor": parts[-1].replace(".", "").replace(",", ".")
-                    })
-        return items
+            # Padrão para linhas de vantagens (código, descrição, valor)
+            if match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)\s*$", line):
+                vantagens.append({
+                    "codigo": match.group(1),
+                    "descricao": match.group(2).strip(),
+                    "valor": float(match.group(3).replace(".", "").replace(",", "."))
+                })
+            # Padrão alternativo para linhas com percentual
+            elif match := re.match(r"(\d{5})\s+([A-ZÀ-Ú./\s]+?)\s+([\d.,]+)%?\s+([\d.,]+)", line):
+                vantagens.append({
+                    "codigo": match.group(1),
+                    "descricao": match.group(2).strip(),
+                    "percentual": float(match.group(3).replace(",", ".")),
+                    "valor": float(match.group(4).replace(".", "").replace(",", "."))
+                })
+        
+        return {"vantagens": vantagens}
 
-@app.post("/parse-pdf")
-async def parse_pdf(file: UploadFile = File(...)):
-    """Endpoint que retorna tanto o texto completo quanto os dados estruturados"""
+@app.post("/extrair-vantagens")
+async def extrair_vantagens(file: UploadFile = File(...)):
+    """Endpoint dedicado à extração da tabela de vantagens"""
     temp_path = "temp_pdf.pdf"
     try:
-        # Salva o arquivo temporariamente
         with open(temp_path, "wb") as f:
             f.write(await file.read())
-
-        processor = PDFProcessor()
         
-        # Extração do texto completo
-        full_text = processor.extract_full_text(temp_path)
-        
-        # Extração de dados estruturados
-        parsed_data = processor.parse_paycheck(full_text)
-        
-        return {
-            "texto_completo": full_text,
-            "dados_estruturados": parsed_data
-        }
-
-    except Exception as e:
-        return {"erro": str(e)}
+        extractor = VantagensExtractor()
+        return extractor.extract_vantagens_section(temp_path)
+    
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
